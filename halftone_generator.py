@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Halftone Pattern Generator v9
------------------------------
+Halftone Pattern Generator
+--------------------------
 Fading shape-grid (halftone) patterns with:
   * Linear / Radial / Curve / None fade modes
   * Draggable on-preview handles: curve points, band edges, radial centre,
     fade start/end, linear angle, flame direction, cell-size ruler
   * Flame effect: noisy, flame-like dropout that favours the small-cell side
   * Adjustable gap between cells (spacing independent of shape size)
+  * Optional rounded image corners (transparent or filled with the
+    background colour outside the radius)
   * Randomise / Mutate with per-parameter locks, plus Undo / Redo history
   * Per-section Randomise buttons (respect locks)
   * Saved pattern library with thumbnails (halftone_patterns.json in the
@@ -20,7 +22,6 @@ Fading shape-grid (halftone) patterns with:
 Requirements:  pip install pillow
 Shortcuts:     R = randomise all, M = mutate, H = show/hide handles,
                Ctrl+S = save pattern, Ctrl+Z = undo, Ctrl+Y = redo
-Troubleshooting: set env var HALFTONE_DEBUG_WHEEL=1 to print wheel events.
 """
 
 import colorsys
@@ -28,7 +29,6 @@ import json
 import math
 import os
 import random
-import shutil
 import time
 from bisect import bisect_right
 from datetime import datetime
@@ -37,18 +37,19 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk, colorchooser, filedialog, messagebox, simpledialog
 
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageTk
 
 try:
     LANCZOS = Image.Resampling.LANCZOS
 except AttributeError:  # older Pillow
     LANCZOS = Image.LANCZOS
 
-APP_DIR = Path.cwd()                                         # folder the script is run from
+APP_DIR = Path.cwd()                          # folder the script is run from
 LIBRARY_PATH = APP_DIR / "halftone_patterns.json"
 UI_STATE_PATH = APP_DIR / "halftone_ui.json"
-OLD_LIBRARY_PATH = Path.home() / ".halftone_patterns.json"   # pre-v9 location
-DEBUG_WHEEL = bool(os.environ.get("HALFTONE_DEBUG_WHEEL"))
+
+# Preview background (also shown outside rounded corners)
+PREVIEW_BG = "#2b2b2b"
 
 # Overlay colours
 C_CURVE, C_BAND, C_CENTER = "#ff8c1a", "#ffb347", "#3ddc97"
@@ -83,7 +84,7 @@ CURVE_PRESETS = {
 }
 
 DEFAULTS = dict(
-    width=1800, height=1200,
+    width=1800, height=1200, corner_radius=0, corner_fill=False,
     shape="Hexagon", grid="Offset (hex)",
     cell=48.0, gap=0.0, max_scale=0.93, min_scale=0.02, rotation=0.0, star_inner=0.45,
     fade_mode="Curve", fade_angle=30.0, fade_start=0.2, fade_end=1.0,
@@ -94,6 +95,10 @@ DEFAULTS = dict(
     jitter=0.0, seed=1.0,
     fg="#46434f", bg="#fbf8ee", transparent=False, supersample="3",
 )
+
+# Settings typed into entry boxes (stored as text in the UI).
+# These have no lock and are never randomised or mutated.
+TEXT_KEYS = ("width", "height", "corner_radius")
 
 
 # --------------------------------------------------------------------------
@@ -316,6 +321,11 @@ def normalize_params(raw):
         except (ValueError, TypeError):
             p[k] = DEFAULTS[k]
     try:
+        p["corner_radius"] = max(0, min(10000, int(float(p["corner_radius"]))))
+    except (ValueError, TypeError):
+        p["corner_radius"] = DEFAULTS["corner_radius"]
+    p["corner_fill"] = bool(p["corner_fill"])
+    try:
         pts = [(float(a), float(b)) for a, b in p["curve_pts"]]
         p["curve_pts"] = pts if len(pts) >= 2 else [tuple(q) for q in CURVE_PRESETS["Wave"]]
     except (TypeError, ValueError):
@@ -378,9 +388,43 @@ def unique_path(folder, stem, ext):
 
 
 # --------------------------------------------------------------------------
+# Rounded corners
+# --------------------------------------------------------------------------
+def rounded_rect_mask(w, h, r):
+    """'L' mask of size w x h: 255 inside a rounded rectangle, 0 outside."""
+    mask = Image.new("L", (w, h), 0)
+    d = ImageDraw.Draw(mask)
+    r = int(round(max(0.0, min(r, min(w, h) / 2))))
+    if r <= 0:
+        d.rectangle((0, 0, w - 1, h - 1), fill=255)
+    elif hasattr(d, "rounded_rectangle"):          # Pillow 8.2+
+        d.rounded_rectangle((0, 0, w - 1, h - 1), radius=r, fill=255)
+    else:                                          # older Pillow
+        d.rectangle((r, 0, w - 1 - r, h - 1), fill=255)
+        d.rectangle((0, r, w - 1, h - 1 - r), fill=255)
+        for x, y in ((0, 0), (w - 1 - 2 * r, 0),
+                     (0, h - 1 - 2 * r), (w - 1 - 2 * r, h - 1 - 2 * r)):
+            d.ellipse((x, y, x + 2 * r, y + 2 * r), fill=255)
+    return mask
+
+
+def corner_mask(p, w, h, ss=2):
+    """Anti-aliased corner mask for an output of w x h, or None if no rounding.
+    The radius is given in export pixels and scaled to the output size."""
+    r = p["corner_radius"] * w / p["width"]
+    if r < 0.5:
+        return None
+    ss = max(1, int(ss))
+    mask = rounded_rect_mask(w * ss, h * ss, r * ss)
+    if ss > 1:
+        mask = mask.resize((w, h), LANCZOS)
+    return mask
+
+
+# --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
-def render(p, out_w, out_h, ss=2, transparent=False):
+def render(p, out_w, out_h, ss=2, transparent=False, round_corners=True):
     ss = max(1, int(ss))
     W, H = out_w * ss, out_h * ss
     k = W / p["width"]
@@ -519,6 +563,21 @@ def render(p, out_w, out_h, ss=2, transparent=False):
 
     if ss > 1:
         img = img.resize((out_w, out_h), LANCZOS)
+
+    if round_corners:
+        mask = corner_mask(p, out_w, out_h, ss)
+        if mask is not None:
+            if p["corner_fill"]:
+                # solid background colour outside the corners
+                fill_col = (bg + (255,)) if img.mode == "RGBA" else bg
+                base = Image.new(img.mode, (out_w, out_h), fill_col)
+                base.paste(img, (0, 0), mask)
+                img = base
+            elif img.mode == "RGBA":
+                img.putalpha(ImageChops.multiply(img.getchannel("A"), mask))
+            else:
+                img = img.convert("RGBA")
+                img.putalpha(mask)
     return img
 
 
@@ -531,12 +590,22 @@ def checkerboard(w, h, tile=10):
     return img
 
 
-def render_display(p, w, h, ss):
-    img = render(p, w, h, ss=ss, transparent=p["transparent"])
+def render_display(p, w, h, ss, outside=PREVIEW_BG):
+    """Render for on-screen display: transparency shown as a checkerboard,
+    area outside rounded corners filled with the preview background colour
+    (or the pattern background colour when corner fill is on)."""
+    img = render(p, w, h, ss=ss, transparent=p["transparent"], round_corners=False)
     if p["transparent"]:
         base = checkerboard(w, h, tile=max(4, min(10, w // 16)))
         base.paste(img, (0, 0), img)
         img = base
+    if p["corner_fill"]:
+        outside = p["bg"]
+    mask = corner_mask(p, w, h, ss)
+    if mask is not None:
+        framed = Image.new("RGB", (w, h), hex_to_rgb(outside))
+        framed.paste(img, (0, 0), mask)
+        img = framed
     return img
 
 
@@ -547,7 +616,7 @@ def read_library(path):
     if not path.exists():
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
-    pats = data.get("patterns", []) if isinstance(data, dict) else data
+    pats = data.get("patterns") if isinstance(data, dict) else None
     if not isinstance(pats, list):
         raise ValueError("Unexpected library format")
     return [q for q in pats if isinstance(q, dict) and "name" in q
@@ -623,7 +692,7 @@ class App:
     WHEEL_PX = 60
     EDIT_COALESCE_S = 1.0      # key presses within this window = one undo step
     STATUS_KEEP = ("Saved", "Loaded", "Updated", "Deleted", "Imported",
-                   "Exported", "Reset", "Randomised", "Copied")
+                   "Exported", "Reset", "Randomised")
 
     def __init__(self, root):
         self.root = root
@@ -679,7 +748,7 @@ class App:
         cv.bind("<Configure>", lambda e: cv.itemconfigure(self._win, width=e.width))
 
         # ---- preview ----
-        self.preview = pv = tk.Canvas(root, bg="#2b2b2b", highlightthickness=0)
+        self.preview = pv = tk.Canvas(root, bg=PREVIEW_BG, highlightthickness=0)
         pv.pack(side="left", fill="both", expand=True)
         pv.bind("<Configure>", lambda e: self.schedule())
         pv.bind("<ButtonPress-1>", self.on_press)
@@ -781,7 +850,7 @@ class App:
             self.ensure_visible(w)
 
     # ======================================================================
-    # Mouse wheel: decided by POINTER POSITION, never changes widget values
+    # Mouse wheel: scrolls by pointer position and never changes widget values
     # ======================================================================
     def install_wheel(self):
         tag = "WheelGuard"
@@ -825,9 +894,6 @@ class App:
                                          e.x_root, e.y_root))
         except tk.TclError:
             path = ""
-        if DEBUG_WHEEL:
-            print(f"wheel: widget={e.widget} delta={getattr(e, 'delta', None)} "
-                  f"num={e.num} pointer_over={path!r}")
         if not path or ".popdown" in path:
             return None
         if self._inside(path, self.panel):
@@ -1067,6 +1133,17 @@ class App:
             self.add_lock(row, key)
         var.trace_add("write", lambda *a: sw.configure(bg=var.get()))
 
+    def entry(self, parent, key, label, width=7):
+        """Text entry for a numeric setting. No lock: never randomised or mutated."""
+        var = tk.StringVar(value=str(DEFAULTS[key]))
+        self.vars[key] = var
+        ttk.Label(parent, text=label).pack(side="left")
+        e = ttk.Entry(parent, textvariable=var, width=width)
+        e.pack(side="left", padx=(2, 10))
+        e.bind("<Return>", lambda ev: self.schedule())
+        e.bind("<FocusOut>", lambda ev: self.schedule())
+        return e
+
     @staticmethod
     def button_row(parent, items, pady=2):
         row = ttk.Frame(parent)
@@ -1149,7 +1226,7 @@ class App:
                 ("■", C_RULER, "Cell size ruler (bottom-left)")):
             row = ttk.Frame(s)
             row.pack(fill="x", pady=1)
-            tk.Label(row, text=sym, fg=col, bg="#2b2b2b", width=2).pack(side="left")
+            tk.Label(row, text=sym, fg=col, bg=PREVIEW_BG, width=2).pack(side="left")
             ttk.Label(row, text=text).pack(side="left", padx=6)
         self.hint(s, lines=[
             "Drag a handle to adjust it. Hold Shift to snap.",
@@ -1175,7 +1252,7 @@ class App:
         self.lib_list.bind("<Return>", lambda e: self.load_selected())
 
         self.thumb = tk.Canvas(s, width=self.THUMB_W, height=self.THUMB_H,
-                               bg="#2b2b2b", highlightthickness=0)
+                               bg=PREVIEW_BG, highlightthickness=0)
         self.thumb.pack(pady=(6, 2))
         ttk.Label(s, textvariable=self.thumb_text, style="Info.TLabel",
                   wraplength=300).pack(anchor="w")
@@ -1192,14 +1269,19 @@ class App:
         s = self.section("Image size (export, px)", lockable=False)
         row = ttk.Frame(s)
         row.pack(fill="x")
-        for key, lbl in (("width", "W"), ("height", "H")):
-            var = tk.StringVar(value=str(DEFAULTS[key]))
-            self.vars[key] = var
-            ttk.Label(row, text=lbl).pack(side="left")
-            e = ttk.Entry(row, textvariable=var, width=7)
-            e.pack(side="left", padx=(2, 10))
-            e.bind("<Return>", lambda ev: self.schedule())
-            e.bind("<FocusOut>", lambda ev: self.schedule())
+        self.entry(row, "width", "W")
+        self.entry(row, "height", "H")
+        row = ttk.Frame(s)
+        row.pack(fill="x", pady=(6, 0))
+        self.entry(row, "corner_radius", "Corner radius (px)", width=6)
+        self.check(s, "corner_fill", "Fill corners with background colour", lock=False)
+        self.hint(s, lines=[
+            "Press Enter or click away to apply a value.",
+            "Corner radius rounds the image corners (0 = square). "
+            "The area outside the corners is transparent in the PNG, "
+            "or the background colour if 'Fill corners' is ticked.",
+            "These settings are never changed by Randomise or Mutate.",
+        ])
 
         # ----- Shape -----
         s = self.section("Shape")
@@ -1311,13 +1393,6 @@ class App:
     # Pattern library
     # ======================================================================
     def load_library(self):
-        # one-time copy from the old home-folder location
-        if not LIBRARY_PATH.exists() and OLD_LIBRARY_PATH.exists():
-            try:
-                shutil.copy2(OLD_LIBRARY_PATH, LIBRARY_PATH)
-                self.status.set(f"Copied saved patterns from {OLD_LIBRARY_PATH}")
-            except OSError:
-                pass
         try:
             self.patterns = read_library(LIBRARY_PATH)
         except (OSError, ValueError) as ex:
@@ -1391,6 +1466,10 @@ class App:
         self.thumb_img = ImageTk.PhotoImage(img)
         self.thumb.create_image(self.THUMB_W // 2, self.THUMB_H // 2, image=self.thumb_img)
         info = f"{entry['name']} · {p['shape']} · {p['fade_mode']} · {p['width']}×{p['height']}"
+        if p["corner_radius"]:
+            info += f" · r{p['corner_radius']}"
+            if p["corner_fill"]:
+                info += " fill"
         if entry.get("saved"):
             info += f"\nSaved {entry['saved'].replace('T', ' ')}"
         self.thumb_text.set(info)
@@ -1529,7 +1608,8 @@ class App:
     def apply_params(self, params):
         p = normalize_params(params)
         snap = {k: p[k] for k in self.vars}
-        snap["width"], snap["height"] = str(p["width"]), str(p["height"])
+        for k in TEXT_KEYS:
+            snap[k] = str(p[k])
         snap["curve_pts"] = [list(q) for q in p["curve_pts"]]
         self.restore(snap)
 
@@ -1617,6 +1697,7 @@ class App:
 
     # ======================================================================
     # Randomise / mutate
+    # (only keys with a lock are touched, so size and corner settings never change)
     # ======================================================================
     def set_value(self, key, value):
         kind = self.meta[key][0]
@@ -1747,7 +1828,12 @@ class App:
         self.preview.create_image(ox, oy, image=self.tkimg, anchor="nw")
         self.draw_overlay(p)
         if not self.status.get().startswith(self.STATUS_KEEP):
-            self.status.set(f"Export size: {p['width']} × {p['height']} px")
+            msg = f"Export size: {p['width']} × {p['height']} px"
+            if p["corner_radius"]:
+                msg += f", corner radius {p['corner_radius']} px"
+                if p["corner_fill"]:
+                    msg += " (filled)"
+            self.status.set(msg)
 
     # ======================================================================
     # Overlay handles: definition
@@ -2198,8 +2284,10 @@ class App:
     # ======================================================================
     def export(self):
         p = self.get_params()
-        default = unique_path(APP_DIR, f"halftone_{describe(p)}_{p['width']}x{p['height']}",
-                              ".png")
+        stem = f"halftone_{describe(p)}_{p['width']}x{p['height']}"
+        if p["corner_radius"]:
+            stem += f"_r{p['corner_radius']}" + ("fill" if p["corner_fill"] else "")
+        default = unique_path(APP_DIR, stem, ".png")
         path = filedialog.asksaveasfilename(
             defaultextension=".png", filetypes=[("PNG image", "*.png")],
             initialdir=str(APP_DIR), initialfile=default.name)
@@ -2222,7 +2310,7 @@ class App:
     def reset(self):
         self.push_history()
         for k, var in self.vars.items():
-            var.set(str(DEFAULTS[k]) if k in ("width", "height") else DEFAULTS[k])
+            var.set(str(DEFAULTS[k]) if k in TEXT_KEYS else DEFAULTS[k])
         self.curve_pts = [pt[:] for pt in CURVE_PRESETS["Wave"]]
         self.schedule()
 
